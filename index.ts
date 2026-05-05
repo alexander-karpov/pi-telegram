@@ -1,6 +1,7 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
+import { formatGitInfoLines, getGitInfo } from "./git-info.js";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
@@ -945,6 +946,9 @@ export default function (pi: ExtensionAPI) {
 			if (lines.length === 0) {
 				lines.push("No usage data yet.");
 			}
+
+			lines.push(...formatGitInfoLines(await getGitInfo()));
+
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, lines.join("\n"));
 			return;
 		}
