@@ -146,6 +146,15 @@ interface TelegramPreviewState {
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
+interface TelegramThinkingBlockState {
+	contentIndex: number;
+	messageId?: number;
+	fullText: string;
+	lastSentText: string;
+	flushTimer?: ReturnType<typeof setTimeout>;
+	finalized: boolean;
+}
+
 interface TelegramMediaGroupState {
 	messages: TelegramMessage[];
 	flushTimer?: ReturnType<typeof setTimeout>;
@@ -159,6 +168,9 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
+const THINKING_HEADER_ACTIVE = "🧠 Thinking…\n";
+const THINKING_HEADER_DONE = "🧠 Thought\n";
+const THINKING_TRUNCATION_PREFIX = "…\n";
 
 const SYSTEM_PROMPT_SUFFIX = `
 
@@ -269,6 +281,39 @@ function chunkParagraphs(text: string): string[] {
 	return chunks;
 }
 
+function isMessageNotModifiedError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	return error.message.includes("message is not modified");
+}
+
+function buildThinkingDisplay(text: string, finalized: boolean): string {
+	const header = finalized ? THINKING_HEADER_DONE : THINKING_HEADER_ACTIVE;
+	const contentBudget = MAX_MESSAGE_LENGTH - header.length;
+	if (contentBudget <= 0) {
+		return header.slice(0, MAX_MESSAGE_LENGTH);
+	}
+
+	const normalized = text.replace(/\r\n/g, "\n");
+	if (normalized.length <= contentBudget) {
+		return `${header}${normalized}`;
+	}
+
+	const tailBudget = contentBudget - THINKING_TRUNCATION_PREFIX.length;
+	if (tailBudget <= 0) {
+		const fallback = `${header}${THINKING_TRUNCATION_PREFIX}`;
+		return fallback.slice(0, MAX_MESSAGE_LENGTH);
+	}
+
+	let tail = normalized.slice(-tailBudget);
+	const newlineIndex = tail.slice(0, 200).indexOf("\n");
+	if (newlineIndex >= 0) {
+		tail = tail.slice(newlineIndex + 1);
+	}
+
+	const display = `${header}${THINKING_TRUNCATION_PREFIX}${tail}`;
+	return display.length <= MAX_MESSAGE_LENGTH ? display : display.slice(0, MAX_MESSAGE_LENGTH);
+}
+
 async function readConfig(): Promise<TelegramConfig> {
 	try {
 		const content = await readFile(CONFIG_PATH, "utf8");
@@ -295,6 +340,8 @@ export default function (pi: ExtensionAPI) {
 	let preserveQueuedTurnsAsHistory = false;
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
+	let thinkingBlocks: Map<number, TelegramThinkingBlockState> = new Map();
+	let activeThinkingIndex: number | undefined;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
@@ -348,6 +395,15 @@ export default function (pi: ExtensionAPI) {
 			throw new Error(data.description || `Telegram API ${method} failed`);
 		}
 		return data.result;
+	}
+
+	async function safeEditMessageText(chatId: number, messageId: number, text: string): Promise<void> {
+		try {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text });
+		} catch (error) {
+			if (isMessageNotModifiedError(error)) return;
+			throw error;
+		}
 	}
 
 	async function callTelegramMultipart<TResponse>(
@@ -418,15 +474,15 @@ export default function (pi: ExtensionAPI) {
 		return (message as unknown as { role?: string }).role === "assistant";
 	}
 
-	function getMessageText(message: AgentMessage): string {
-		const value = message as unknown as Record<string, unknown>;
-		const content = Array.isArray(value.content) ? value.content : [];
-		return content
-			.filter((block): block is { type: string; text?: string } => typeof block === "object" && block !== null && "type" in block)
-			.filter((block) => block.type === "text" && typeof block.text === "string")
-			.map((block) => block.text as string)
-			.join("")
-			.trim();
+	function resetThinkingState(): void {
+		for (const block of thinkingBlocks.values()) {
+			if (block.flushTimer) {
+				clearTimeout(block.flushTimer);
+				block.flushTimer = undefined;
+			}
+		}
+		thinkingBlocks = new Map();
+		activeThinkingIndex = undefined;
 	}
 
 	async function clearPreview(chatId: number): Promise<void> {
@@ -444,6 +500,75 @@ export default function (pi: ExtensionAPI) {
 				// ignore
 			}
 		}
+	}
+
+	function ensureThinkingBlock(contentIndex: number): TelegramThinkingBlockState {
+		const existing = thinkingBlocks.get(contentIndex);
+		if (existing) return existing;
+		const block: TelegramThinkingBlockState = {
+			contentIndex,
+			fullText: "",
+			lastSentText: "",
+			finalized: false,
+		};
+		thinkingBlocks.set(contentIndex, block);
+		return block;
+	}
+
+	async function flushThinkingBlock(chatId: number, block: TelegramThinkingBlockState, finalized: boolean): Promise<void> {
+		if (block.flushTimer) {
+			clearTimeout(block.flushTimer);
+			block.flushTimer = undefined;
+		}
+		if (block.finalized) return;
+		if (block.fullText.trim().length === 0) {
+			if (finalized) block.finalized = true;
+			return;
+		}
+
+		const rendered = buildThinkingDisplay(block.fullText, finalized);
+		try {
+			if (block.messageId === undefined) {
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: rendered });
+				block.messageId = sent.message_id;
+				block.lastSentText = rendered;
+			} else if (rendered !== block.lastSentText) {
+				await safeEditMessageText(chatId, block.messageId, rendered);
+				block.lastSentText = rendered;
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(`[telegram] thinking flush failed: ${message}`);
+		}
+
+		if (finalized) {
+			block.finalized = true;
+		}
+	}
+
+	function scheduleThinkingFlush(chatId: number, block: TelegramThinkingBlockState): void {
+		if (block.finalized || block.flushTimer) return;
+		block.flushTimer = setTimeout(() => {
+			void flushThinkingBlock(chatId, block, false);
+		}, PREVIEW_THROTTLE_MS);
+	}
+
+	async function finalizeThinkingBlock(chatId: number, contentIndex: number): Promise<void> {
+		const block = thinkingBlocks.get(contentIndex);
+		if (!block || block.finalized) return;
+		await flushThinkingBlock(chatId, block, true);
+		if (activeThinkingIndex === contentIndex) {
+			activeThinkingIndex = undefined;
+		}
+	}
+
+	async function finalizeAllThinkingBlocks(chatId: number): Promise<void> {
+		const ordered = [...thinkingBlocks.values()].sort((left, right) => left.contentIndex - right.contentIndex);
+		for (const block of ordered) {
+			if (block.finalized) continue;
+			await flushThinkingBlock(chatId, block, true);
+		}
+		activeThinkingIndex = undefined;
 	}
 
 	async function flushPreview(chatId: number): Promise<void> {
@@ -475,7 +600,7 @@ export default function (pi: ExtensionAPI) {
 			state.lastSentText = truncated;
 			return;
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		await safeEditMessageText(chatId, state.messageId, truncated);
 		state.mode = "message";
 		state.lastSentText = truncated;
 	}
@@ -746,6 +871,10 @@ export default function (pi: ExtensionAPI) {
 				if (queuedTelegramTurns.length > 0) {
 					preserveQueuedTurnsAsHistory = true;
 				}
+				if (activeTelegramTurn) {
+					await finalizeAllThinkingBlocks(activeTelegramTurn.chatId);
+				}
+				resetThinkingState();
 				currentAbort();
 				updateStatus(ctx);
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Aborted current turn.");
@@ -1032,6 +1161,7 @@ export default function (pi: ExtensionAPI) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
 		}
 		mediaGroups.clear();
+		resetThinkingState();
 		if (activeTelegramTurn) {
 			await clearPreview(activeTelegramTurn.chatId);
 		}
@@ -1052,6 +1182,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		currentAbort = () => ctx.abort();
+		resetThinkingState();
 		if (!activeTelegramTurn && queuedTelegramTurns.length > 0) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
@@ -1065,6 +1196,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("message_start", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
+		await finalizeAllThinkingBlocks(activeTelegramTurn.chatId);
+		resetThinkingState();
 		if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
 			await finalizePreview(activeTelegramTurn.chatId);
 		}
@@ -1073,11 +1206,74 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("message_update", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
-		if (!previewState) {
-			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+		const streamEvent = (event as unknown as { assistantMessageEvent?: Record<string, unknown> }).assistantMessageEvent;
+		const eventType = typeof streamEvent?.type === "string" ? streamEvent.type : undefined;
+		if (!eventType) return;
+		const chatId = activeTelegramTurn.chatId;
+
+		if (eventType === "thinking_start") {
+			const contentIndex = typeof streamEvent.contentIndex === "number" ? streamEvent.contentIndex : 0;
+			thinkingBlocks.set(contentIndex, {
+				contentIndex,
+				fullText: "",
+				lastSentText: "",
+				finalized: false,
+			});
+			activeThinkingIndex = contentIndex;
+			return;
 		}
-		previewState.pendingText = getMessageText(event.message);
-		schedulePreviewFlush(activeTelegramTurn.chatId);
+
+		if (eventType === "thinking_delta") {
+			const contentIndex = typeof streamEvent.contentIndex === "number" ? streamEvent.contentIndex : activeThinkingIndex ?? 0;
+			const delta = typeof streamEvent.delta === "string" ? streamEvent.delta : "";
+			const block = ensureThinkingBlock(contentIndex);
+			block.fullText += delta;
+			activeThinkingIndex = contentIndex;
+			scheduleThinkingFlush(chatId, block);
+			return;
+		}
+
+		if (eventType === "thinking_end") {
+			const contentIndex = typeof streamEvent.contentIndex === "number" ? streamEvent.contentIndex : activeThinkingIndex ?? 0;
+			const block = ensureThinkingBlock(contentIndex);
+			if (typeof streamEvent.content === "string") {
+				block.fullText = streamEvent.content;
+			}
+			await finalizeThinkingBlock(chatId, contentIndex);
+			return;
+		}
+
+		if (eventType === "text_start") {
+			if (activeThinkingIndex !== undefined) {
+				await finalizeThinkingBlock(chatId, activeThinkingIndex);
+			}
+			if (!previewState) {
+				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			} else {
+				previewState.pendingText = "";
+			}
+			return;
+		}
+
+		if (eventType === "text_delta") {
+			if (!previewState) {
+				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			}
+			const delta = typeof streamEvent.delta === "string" ? streamEvent.delta : "";
+			previewState.pendingText += delta;
+			schedulePreviewFlush(chatId);
+			return;
+		}
+
+		if (eventType === "text_end") {
+			if (!previewState) {
+				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			}
+			if (typeof streamEvent.content === "string") {
+				previewState.pendingText = streamEvent.content;
+			}
+			schedulePreviewFlush(chatId);
+		}
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
@@ -1086,7 +1282,12 @@ export default function (pi: ExtensionAPI) {
 		stopTypingLoop();
 		activeTelegramTurn = undefined;
 		updateStatus(ctx);
-		if (!turn) return;
+		if (!turn) {
+			resetThinkingState();
+			return;
+		}
+		await finalizeAllThinkingBlocks(turn.chatId);
+		resetThinkingState();
 
 		const assistant = extractAssistantText(event.messages);
 		if (assistant.stopReason === "aborted") {
